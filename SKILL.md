@@ -1,6 +1,6 @@
 ---
 name: comindware-log-analysis
-description: Analyze Comindware platform logs to diagnose incidents. Use when you need to find the root cause of an issue from Comindware logs (e.g. user mentions "логи Comindware", "анализ логов платформы"): performance problems and slow work, errors and exceptions, service crashes/restarts, integration and data exchange issues, authentication and licensing problems, database problems. Runs an interview to determine the problem type and time window, then analyzes only the relevant log files from the user-provided directory within the specified period, and produces a detailed report with log excerpts, a timeline, and recommended solutions.
+description: Analyze Comindware platform logs to diagnose incidents. Use when you need to find the root cause of an issue from Comindware logs (e.g. user mentions "логи Comindware", "анализ логов платформы"): performance problems, slow work and freezes/hangs, errors and exceptions, service crashes/restarts, integration and data exchange issues, authentication and licensing problems, database problems, change history (журнал изменений) not written. Runs an interview to determine the problem type and time window, then analyzes only the relevant log files from the user-provided directory within the specified period, and produces a detailed report with log excerpts, a timeline, and recommended solutions.
 ---
 
 # Comindware Log Analysis
@@ -22,7 +22,17 @@ Ask the user to pick a category (multiple allowed):
 | Service crashes | Platform services restart/stop, service fails to start |
 | Integrations and data exchange | Issues with external systems, data exchange, webhooks, import/export |
 | Authentication and licensing | Login problems, authorization failures, expired/licensing errors |
-| Database | DB errors, slow queries, locks, data loss (on Linux stack the DB is Apache Ignite — memory exhaustion, stalled checkpoints, node restarts) |
+| Database | DB errors, slow queries, locks, data loss (data layer: Comindware ElasticData triple store on Apache Ignite — memory exhaustion, stalled checkpoints, node restarts); change history / «журнал изменений» not written (OpenSearch journal service — see 2.2g) |
+
+Typical user phrasings map to categories as follows:
+
+- «платформа зависла / тормозит / таймауты» → Performance (see 2.2f);
+- «журнал изменений не записывается / история не отображается» → journal service / Database (see 2.2g);
+- «обмен не работает / интеграция упала / OData не отвечает» → Integrations (see 2.2c);
+- «процесс зациклился» → process log (see 2.2h);
+- «ошибка скриптовой операции / кнопки» → Errors + scenario log (see 2.2h);
+- «не входит / слетела лицензия после переезда сервера» → Authentication and licensing (see 2.2d);
+- «перестала открываться таблица / не отображаются кнопки или значения» → Errors; check the KB troubleshooting articles (see KB references appendix).
 
 ### 1.2 Clarifying questions
 
@@ -66,15 +76,16 @@ Before analyzing, write down the selected window: `from <datetime> to <datetime>
 ### 2.1 First inspect the structure
 
 Before deep searching:
-1. If `LEARNINGS.md` exists in the skill directory (`/home/alesha/gh-repos/comindware-log-analysis/`), read it and apply the recorded lessons (markers, correlations, methodologies) during this analysis.
+1. If `LEARNINGS.md` exists in the skill directory (the folder containing this `SKILL.md`), read it and apply the recorded lessons (markers, correlations, methodologies) during this analysis.
 2. List the contents of the given directory (recursively).
 3. Determine the stack and deployment type from the file inventory (do not ask the user — derive it from the logs):
    - **Windows/IIS deployment**: IIS logs (`W3SVC*.log`, `u_ex*.log`), `*.evtx` Windows Event logs;
-   - **Linux deployment**: nginx (`access.log`/`error.log` rotation), `*.service` systemd units, `journal.log` (systemd journal dump), Kafka (`kafka/`, `kafkaClient_*.log`), Apache Ignite (`igniteClient_*.log`, `ignite/Ignite.config`), `journalservice/` (audit/search index service);
+   - **Linux deployment**: nginx (`access.log`/`error.log` rotation), `*.service` systemd units, `journal.log` (systemd journal dump), Kafka (`kafka/`, `kafkaClient_*.log`), Apache Ignite (`igniteClient_*.log`, `ignite/Ignite.config`), `journalservice/` (OpenSearch/Elasticsearch transaction-journaling service — powers the change history, see 2.2g);
    - MongoDB logs (`mongod.log`) → MongoDB database;
    - platform root logs `comindware*.log` or service logs.
-4. Identify the **stand name** (e.g., `cmwdata`) from file/directory prefixes: `<standname>.yml`, `<standname>_logs/`, `<standname>-access.log`, `comindware<standname>.service`. The stand name is used across configs and log names.
-5. Summarize: which files were found, their sizes, and the period they cover (from first to last record). Note the large files (hundreds of MB in nginx/performance/igniteClient) — read them only via targeted search, never fully.
+4. Identify the **stand name** (e.g., `cmwdata`) from file/directory prefixes: `<standname>.yml`, `<standname>_logs/`, `<standname>-access.log`, `comindware<standname>.service`. The stand name is used across configs and log names. The platform runs **three units/services**: `comindware<instanceName>` (runtime), `apigateway<instanceName>`, `adapterhost<instanceName>` — track all three in `journal.log`/`status.log`, not just the runtime one.
+5. **Parse the config files present in the dump** (see 2.1b): `<standname>.yml` (instance config), `apigateway.yml`, `adapterhost.yml`, `logs.config` (which file logs are enabled, at which levels, retention). Cross-check config values against observed errors: `mq.server` vs Kafka config, `journal.enabled` vs missing history, `db.jvmOpts` vs Ignite heap ceiling, storage paths vs disk-full events.
+6. Summarize: which files were found, their sizes, and the period they cover (from first to last record). Note the large files (hundreds of MB in nginx/performance/igniteClient) — read them only via targeted search, never fully.
 
 ### 2.1a Typical incident dump layout
 
@@ -89,28 +100,50 @@ comindware<standname>.service  # systemd unit
 status.log                 # services status at dump time
 journal.log                # systemd journal dump
 <standname>_logs/          # main platform logs, one file per component per day:
-    <component>_YYYY-MM-DD.log     # e.g. system_, error_, performance_, process_, audit_, heartbeat_, backup_, upgrade_
+    <component>_YYYY-MM-DD.log     # system_, error_, performance_, process_, audit_, heartbeat_, backup_,
+                                   # update_ (+ UpgradeOntology.log), trigger_ (scenarios), integration_,
+                                   # integration_raw_, transfer_export_/transfer_import_ (version control)
     adapter_external_*.log         # external integrations/adapters (system, heartbeat, kafkaClient)
     adapter_internal_*.log         # internal adapters (+ _error_ suffix for adapter errors)
     apigateway_*.log               # API gateway
-    igniteClient_*.log             # Apache Ignite client (can be very large)
+    igniteClient_*.log             # Apache Ignite client — ElasticData storage layer (can be very large)
     kafkaClient_*.log              # Kafka client
 nginx/                    # reverse proxy logs + rotation
     <standname>-access.log, <standname>-access.log.N[.gz]
     <standname>-error.log, error.log
 kafka/                    # Kafka server: controller.log, server.log, server.properties, kafka.service
 ignite/                   # Ignite config
-journalservice/           # journal/index service: cluster_health.log, indices_stats.log, instance_indices.log, service_info.log
+journalservice/           # OpenSearch transaction-journaling service (change history): cluster_health.log, indices_stats.log, instance_indices.log, service_info.log
 permissions/              # filesystem permissions dump
 ```
 
 Log naming convention in `<standname>_logs/`: `<component>_YYYY-MM-DD.log` (a day per file, often two days present: the incident day and the day before).
 
+**Full inventory of platform file logs** (KB «Подсистема журналирования»; NLog-based; retention 100 days by default, per-log limit via `archiveFilesCount` in `logs.config`):
+
+| File | Contents |
+|------|---------|
+| `system_*.log` | system-level events of the instance |
+| `error_*.log` | all errors + application version import/export (transfer) events |
+| `audit_*.log` | security/audit: successful and failed logins, logouts, client web requests, role/group/permission changes, unauthorized access attempts (format is version-dependent — see 2.2f) |
+| `performance_*.log` | per-request/per-operation durations (requires performance monitoring to be enabled — see 2.4) |
+| `process_*.log` | token movement over process-instance elements (see 2.2h) |
+| `trigger_*.log` | scenario (сценарий) execution: initiator, scenario id, triggering event type, record template/record id, duration, per-action breakdown (see 2.2h) |
+| `integration_*.log` | integration-service events (connections, adapters) with **integration id and connection id** |
+| `integration_raw_*.log` | same as integration + full message payloads from external systems; 100 MB cap, then rolls to `<name>_YYYY-MM-DD.<n>.log` |
+| `heartbeat_*.log` | instance health: **disk space**, connection usage, OpenSearch journal-service state, subsystems, process instances |
+| `backup_*.log` | backup results |
+| `update_*.log` + `UpgradeOntology.log` | version-upgrade progress / data-structure (ontology) upgrade — check whenever the incident follows an update |
+| `transfer_export_*.log` / `transfer_import_*.log` | application version export/import (version control) |
+| `adapter_*` | adapter/connection logs (see 2.1a and 2.2c) |
+
+Event levels (NLog): `Fatal` (critical failure), `Error`, `Warn` (incorrect behavior but keeps working), `Info` (regular events), `Debug` (query execution, user authentication), `Trace` (method start/finish). If `logs.config` is present in the dump, read it to learn which logs were enabled and at which minimum level — feed this into the completeness check (2.4).
+
 **`journal.log`** is a dump of the systemd journal (journalctl output). Line format:
 ```
 мес дд чч:мм:сс <hostname> <unit>/<process>[<pid>]: <message>
 ```
-Also contains `-- Logs begin at <date>, end at <date> --`. The platform service is `comindware<standname>.service` (e.g. `comindwarecmwdata.service`). Watch for systemd lifecycle lines: `Main process exited`, `Failed with result`, `SERVICE_STOP`/`SERVICE_START`, `CRON ... systemctl start`.
+Also contains `-- Logs begin at <date>, end at <date> --`. The platform consists of three units: `comindware<standname>.service` (runtime, e.g. `comindwarecmwdata.service`), `apigateway<standname>.service` and `adapterhost<standname>.service` — track all three. Watch for systemd lifecycle lines: `Main process exited`, `Failed with result`, `SERVICE_STOP`/`SERVICE_START`, `CRON ... systemctl start`.
 
 **`adapter_*_*.log`** — adapter host / integration logs (external and internal adapters). Naming:
 - `adapter_external_system_*.log` — external adapter host lifecycle (start/stop, loaded config from `adapterhost.yml`, MQ connection settings);
@@ -127,7 +160,7 @@ Also contains `-- Logs begin at <date>, end at <date> --`. The platform service 
 ```
 The `Procedure`/`Endpoint`/`Adapter` fields identify exactly which integration route failed. Common errors: `Instance not started: ... Путь передачи данных «<name>» отключен` (data-transfer path disabled / instance down).
 
-**`igniteClient_*.log`** is the log of the embedded Apache Ignite node — **the platform's database** (in-memory + persistent regions, WAL, checkpoints, off-heap memory). It is one of the largest files (can be ~100MB/day) and is mostly periodic metrics. Key content:
+**`igniteClient_*.log`** is the log of the embedded Apache Ignite node — the **storage layer of the platform's data**. The DBMS itself is **Comindware ElasticData** (proprietary triple store: subject–predicate–value records persisted through Ignite caches), so Ignite is where the data physically lives (in-memory + persistent regions, WAL, checkpoints, off-heap memory). It is one of the largest files (can be ~100MB/day) and is mostly periodic metrics. Key content:
 - periodic metric blocks: `Metrics for local node`, `Heap [used=XMB, free=Y%]`, `Off-heap memory [used=..., allocated=...]`, `Data storage metrics for local node`, thread pools, `FreeList`, region stats;
 - data regions: `Persistent region [type=user, persistence=true, ...]` (disk-backed), `InMemory region [type=user, persistence=false, ...]`, `Default_Region`, internal regions;
 - `checkpoint` lines (persistence checkpoint progress; look for stalled/old checkpoints — e.g. "earliest reserved checkpoint" stuck — a sign of write problems);
@@ -136,18 +169,48 @@ The `Procedure`/`Endpoint`/`Adapter` fields identify exactly which integration r
 - noise `WARN`s: "Stack smashing detected", "Consistent ID is not set", "New version is available".
 `ignite/Ignite.config` holds the node configuration; `ignite/no_ignite_logs.log` (if present) says the dedicated Ignite log dir was not found.
 
+### 2.1b Standard paths and configuration files (from the KB)
+
+Default on-server layout (KB «Пути и содержимое директорий экземпляра ПО») — use it to interpret absolute paths in stack traces, configs, and errors:
+
+| What | Linux | Windows |
+|------|-------|---------|
+| Instance config (`<instanceName>.yml`) | `/usr/share/comindware/configs/instance/<instanceName>.yml` | `C:\ProgramData\comindware\configs\instance\<instanceName>.yml` |
+| Executables + configs (`logs.config`, `adapterhost.yml`, `apigateway.yml`, `Ignite.config`) | `/var/www/<instanceName>/` | `C:\ProgramData\comindware\Instances\<instanceName>\config\` |
+| File logs | `/var/log/comindware/<instanceName>/Logs/` | `C:\ProgramData\comindware\Instances\<instanceName>\Logs\` |
+| Database files | `/var/lib/comindware/<instanceName>/Database/db` | `...\Instances\<instanceName>\Database` |
+| Compiled C# scripts | `/var/lib/comindware/<instanceName>/Database/Scripts` | `...\Instances\<instanceName>\Database\Scripts` |
+| WAL (write-ahead log) | `/var/lib/comindware/<instanceName>/Database/wal` | `...\Instances\<instanceName>\Database\wal` |
+| Ignite snapshots | `/var/lib/comindware/<instanceName>/Database/snapshots` | `...\Instances\<instanceName>\Database\snapshots` |
+| Full-text search indexes | `/var/lib/comindware/<instanceName>/Database/FullTextSearch` | `...\Instances\<instanceName>\Database\FullTextSearch` |
+| Attachments | `/var/lib/comindware/<instanceName>/Streams` | `...\Instances\<instanceName>\Streams` |
+| Temp files | `Temp`, `LocalTemp` under `/var/lib/comindware/<instanceName>/` | `...\Instances\<instanceName>\Temp`, `LocalTemp` |
+
+Practical corollaries: stalled Ignite checkpoints → check free space on the disk holding `Database/wal`; disk-full incidents often come from `Streams`/logs growth; stack frames under `Database/Scripts/*.dll` = user-defined C# scripts.
+
+**Key directives of the instance YML** (`<standname>.yml`; KB «Конфигурация экземпляра, компонентов ПО и служб»):
+
+- `clusterName`, `version`, `fqdn`, `port` — stand identity and version (cross-check with `<Version>` in `error_*.log`).
+- `journal.server` / `journal.name` / `journal.username` / `journal.enabled` — the **OpenSearch/Elasticsearch journal service** (change history). `journal.enabled: false` explains "history not written". Legacy directive: `elasticsearchUri`. Index names: lowercase/digits only, others are normalized to `_`.
+- `db.*` — data layer: `db.workDir`, `db.name` (cache prefix → caches `<db.name>datatdb_*`), `db.jvmOpts`/`db.javaOpts` (Ignite heap ceiling), `db.weight`, `db.consistentId`, `db.n3Dir` (Comindware N3 ontology path), `db.cacheConfig.*` (cacheMode Partitioned|Replicated, backups, rebalanceDelay/Mode, writeSynchronizationMode), `db.asThinClient(Endpoints)`.
+- `mq.*` — Kafka message broker: `mq.server`, `mq.group`, `mq.name`, `mq.node`, `mq.enabled`, `mq.securityProtocol` (Plaintext|Ssl|SaslPlaintext|SaslSsl), `mq.sasl.*`, `mq.replicationFactor`, `mq.numPartitions`, `mq.metadataTimeoutMsec`, `mq.adapter.N.enabled` / `.producer.enabled` / `.consumer.enabled` (per-adapter broker channels).
+- `userStorage.*` / `tempStorage.*` — LocalDisk or S3 for attachments/temp files (S3 unreachable → attachment/temp-file errors).
+- OpenID directives, password policy — for authentication incidents.
+
+**`logs.config`** (NLog configuration): which file logs exist, minimum levels, `archiveFilesCount` (retention; 100 days by default). Linux: `/var/www/<instanceName>/logs.config`; Windows: `C:\ProgramData\Comindware\Instances\<instanceName>\Config\logs.config`; custom adapters: `data/Plugins/Agent/logs.config`.
+
 ### 2.2 Select relevant logs by category
 
 Determine which files to look at based on the category. Adapt to the actual stack found in 2.1 (IIS vs nginx, MongoDB vs Ignite/Kafka, etc.):
 
 | Category | Logs to check first |
 |-----------|------------------------------|
-| Performance | `performance_*.log` (platform perf), `apigateway_*.log` / IIS logs (`time-taken`, response codes), `igniteClient_*.log` (cache latency), `kafkaClient_*.log`, nginx access logs (slow upstream responses, HTTP 500/503) |
+| Performance | `performance_*.log` (platform perf), `trigger_*.log` (slow scenarios), `process_*.log` (token loops), `apigateway_*.log` / IIS logs (`time-taken`, response codes), `igniteClient_*.log` (cache latency), `kafkaClient_*.log`, nginx access logs (slow upstream responses, HTTP 500/503) |
 | Errors and exceptions | `error_*.log` and `<component>_*_error_*.log`, root `error_*.log`; search for `ERROR`, `Exception`, `FATAL`. Cross-check with `system_*.log` for context. **If `error_*.log` is inconclusive but the platform crashed/hung → `journal.log` (SIGKILL/OOM-killer) and `igniteClient_*.log` (Heap/Off-heap exhaustion, node restarts)** |
 | Service crashes | `journal.log` (systemd journal: `Main process exited`, `Failed with result`, `SERVICE_STOP`/`SERVICE_START`, `oom-killer`), `process_*.log` (service lifecycle), `status.log` (services status at dump time), `heartbeat_*.log` (missing heartbeats = down service), `igniteClient_*.log` (node restart/memory exhaustion before crash) |
 | Integrations and data exchange | `adapter_internal_system_*.log` + `adapter_internal_system_error_*.log` (endpoint/procedure errors), `adapter_external_system_*.log` + `adapter_external_heartbeat_*.log` (adapter host health), `adapter_<connection-name>_*.log` (specific connections), `integration_raw*` (OData), `kafka/` + `kafkaClient_*.log` (message bus), `apigateway_*.log` (API routing), nginx `error.log` |
 | Authentication and licensing | `error_*.log` (login failures, license errors — component `Session`/`ExtAudit`/`Service`), `system_*.log` (AD/directory activity, domain sync) + `idm*` log if present (identity-management / AD details), `apigateway_*.log` (401/403), nginx/IIS access logs (401/403 spikes), `journal.log` (auth-related) |
-| Database | **`igniteClient_*.log`** — the platform's database IS Apache Ignite (in-memory + persistent regions, WAL, checkpoints, off-heap memory). Look at `Data storage metrics`, `Heap`/`Off-heap` usage, checkpoint progress, region stats, and error/WARN markers. `journalservice/*` (index/search cluster health, indices stats) if journal-related |
+| Database | **`igniteClient_*.log`** — data layer: Comindware ElasticData (triple store) persisted by Apache Ignite (in-memory + persistent regions, WAL, checkpoints, off-heap memory). Look at `Data storage metrics`, `Heap`/`Off-heap` usage, checkpoint progress, region stats, error/WARN markers, and triple-uniqueness errors in `error_*.log`. If the **change history/journal** is the problem → `journalservice/*` (OpenSearch cluster health, indices stats) + `journal.*` directives in the instance YML (see 2.2g) |
 
 Common fallback: if the component is unclear, start from `system_*.log` (service activity overview), `error_*.log` (all errors), and `status.log` / `journal.log` (what was running at the time).
 
@@ -345,7 +408,8 @@ Authentication and licensing problems are found **primarily in `error_*.log`** (
    - component `Session` entries around `SessionIdentityService` — session creation/validation errors.
 2. **License errors** — search for license keywords (English and Russian):
    - `licen`, `license`, `activation`, `expired`, `invalid token`, `лиценз`;
-   - licensing often surfaces as DI-activation exceptions (`An exception was thrown while activating λ:Comindware.Platform.Api.Services.IThemeService -> ...`) or `Operation "GET" completed with an error` — trace the underlying cause in the stack, not the wrapper.
+   - licensing often surfaces as DI-activation exceptions (`An exception was thrown while activating λ:Comindware.Platform.Api.Services.IThemeService -> ...`) or `Operation "GET" completed with an error` — trace the underlying cause in the stack, not the wrapper;
+   - **license model specifics** (KB «Лицензирование»): the license key is **bound to the hardware** at activation — Linux: machine id + motherboard serial number; Windows: CPU id + motherboard serial (fallback: disk `C:` serial). After a VM migration, hardware change, or restore from backup the activation breaks → mass license/login failures; re-activation is required (online, or manual via request/response files). Named licenses are assigned to accounts/groups, concurrent licenses — to groups; group licenses are consumed when members log in and released on logout/inactivity. An expired key shows «Осталось дней» = 0. After a DB restore, license keys are recovered via a separate procedure — always ask whether the incident follows a restore/migration.
 3. **Correlate with HTTP status codes**: `401`/`403` in `apigateway_*.log` and nginx/IIS access logs — a spike of `401` = mass login/session failures; `403` = permissions (see category "Errors": `У аккаунта ... нет разрешения ...`).
 4. **Distinguish signal from noise**:
    - `ExtAudit` `ASYNC: "Authentication error occurred while processing the service request."` is recurring background noise — count them but do not treat a steady trickle as the incident;
@@ -357,9 +421,9 @@ Authentication and licensing problems are found **primarily in `error_*.log`** (
    - **`idm*` log** (e.g. `idm_*.log` or an `idm` component file) — identity-management service log with AD sync/authentication details; if present, check it alongside `system_*.log` for AD auth/sync errors. (If no `idm*` file exists in the dump, say so — it may be missing from the dump.)
    - Errors like "directory server authentication mode is being used" point at external directory config; correlate with directory-server availability in `system_*.log`/`journal.log`.
 
-### 2.2e Database (Apache Ignite) — analysis approach
+### 2.2e Database (Comindware ElasticData on Apache Ignite) — analysis approach
 
-The platform's database is **Apache Ignite** (embedded node, log file `igniteClient_*.log`). There is no MongoDB on this stack. Ignite problems look like: slow data operations, checkpoints not completing, memory exhaustion, node restarts, or "database" errors surfacing in `error_*.log`/`system_*.log`.
+The platform's DBMS is **Comindware ElasticData** — a proprietary triple store (subject–predicate–value) — with **Apache Ignite** (embedded node, log file `igniteClient_*.log`) as its storage layer. On typical v5/v6 stacks there is no MongoDB. Problems look like: slow data operations, checkpoints not completing, memory exhaustion, node restarts, or "database" errors surfacing in `error_*.log`/`system_*.log` — including triple-store-specific ones: `Транзакция нарушает уникальность триплета: <subject> – <value>` = a duplicate of a unique value (e.g., account email). App caches are named after the `db.name` directive of the instance YML: `<db.name>datatdb_*` (e.g. `cmwdatadatatdb_…`).
 
 1. **Memory pressure** — track `Heap [used=XMB, free=Y%]` and `Off-heap memory [used=..., allocated=...]` across the window:
    - rising `used` + falling `free%` toward a crash = leak/exhaustion → correlate with node restart and OOM;
@@ -370,7 +434,7 @@ The platform's database is **Apache Ignite** (embedded node, log file `igniteCli
 5. **Slow data operations** — correlate with `performance_*.log` `DataCommit`/`NativeQuery` and `error_*.log` database-related exceptions; Ignite stores the app data (caches like `cmwdatadatatdb_*` seen in `system_*.log`).
 6. **Node health/restarts** — new `IgniteConfiguration ... nodeId=<new id>` blocks = node restarts; `StopNodeOrHaltFailureHandler` halts the node on failure.
 7. **Data storage metrics** — `Data storage metrics for local node` blocks contain per-cache storage usage — use to see which cache grows.
-8. **If MongoDB is present** (only on stacks that have it — `mongod.log`), apply the standard MongoDB markers; on this Linux stack it is Ignite instead.
+8. **If MongoDB is present** (legacy/other stacks only — `mongod.log`), apply the standard MongoDB markers; the v5/v6 Linux stack uses ElasticData/Ignite instead.
 
 ### 2.2f Platform freezes / hangs (зависания) — analysis approach
 
@@ -378,7 +442,7 @@ When users report "платформа зависла" (freezes at specific times
 
 1. **Build the degradation curve first** (`performance_*.log`). Produce a per-minute table of count / max / avg `Duration` in the window: the freeze is not instantaneous — operations degrade over minutes, then stall. Compute the **effective start** of each long operation as `Time − Duration`; the earliest such start in the window is the onset.
 2. **Check whether the onset is global.** If several **unrelated users** (different `Account` values) have operations that start hanging in the **same second** — it is a systemic/global stall (memory/GC, lock, pool exhaustion), NOT a single user's action. One user opening a list or pressing a button cannot simultaneously stall 6–10 other users.
-3. **Analyze user behavior in `audit_*.log`** (JSON lines: `time`, `sessionId`, `sessionUser`, `url`) in the minutes BEFORE the onset:
+3. **Analyze user behavior in `audit_*.log`** in the minutes BEFORE the onset. Audit format is version-dependent: newer stands write JSON lines (`time`, `sessionId`, `sessionUser`, `url`); older stands write space-delimited NLog lines (date time, level, session id, username, IP, URL, status `OK`, elapsed, quoted message — see KB «Примеры событий в файловых журналах»). Detect the format from the first lines and parse accordingly. Look for:
    - repeated opens of the same list — `ToolbarApi/GetListToolbar/oa.*/lst.N`, `PersonalDatasetConfigurationApi/lst.N` (e.g. tens of opens of one list per 15 min = auto-refresh/retry loop, a **load amplifier**);
    - form operations — `Dataform/QueryForm`, `PersonalFormApi/Put`;
    - button/command executions — `Records/Execute`, `UserCommandExecutionService.Execute`, `event.N` in `UserCommandConfigurationApi/GetOperationData`, which can run for minutes and hold locks.
@@ -387,6 +451,33 @@ When users report "платформа зависла" (freezes at specific times
 5. **Track memory.** `heartbeat_*.log` `PerformanceHelper.Perform` lines carry `TotalProcessMemory`/`TotalGCMemory`/`DeltaProcessMemory`; `status.log` carries process RSS at dump time; `igniteClient_*.log` `Heap [used=...]` tells whether the embedded DB is the memory hog or not. If .NET/mono memory grows **monotonically between service restarts** and freezes recur at high values → the freeze is memory-driven (GC stall on a huge heap); a service restart is only a band-aid that resets the counter.
 6. **Correlate with `journal.log`**: service `Main process exited, code=killed, status=9/KILL` + restart cycles + `Consumed <N>h ... CPU time` (how long the process ran before it had to be killed). Repeated kill/restart cycles every 2–3 hours confirm a **recurring** freeze pattern.
 7. **Recommendations**: a restart stabilizes temporarily but does NOT solve a recurring freeze. Always (a) snapshot the .NET/mono heap before the freeze to see what accumulates (caches/sessions/script assemblies); (b) review the heavy lists/events behind the identified `lst.*`/`event.*` operations (their datasets/queries and the scripts behind buttons); (c) review GC settings / cache limits / platform version. Treat the recurring kill cycle as evidence of an underlying growth problem, not as a fixable-by-restart issue.
+
+### 2.2g History/change journal not written (OpenSearch journal service) — analysis approach
+
+The change history («Журнал изменений», event chains of records and process instances) is stored by the **transaction-journaling service on OpenSearch/Elasticsearch** — not in Ignite. Symptom: «журнал изменений не записывается / история не отображается».
+
+1. **Check the config first** — `journal.server`, `journal.name`, `journal.enabled` in `<standname>.yml` (legacy `elasticsearchUri`). `journal.enabled: false`, a wrong URL, credentials, or index prefix explains everything. Index names are `cmw_<prefix>…` (lowercase letters and digits only; capitals/special characters are normalized to `_`).
+2. **`journalservice/*` logs** in the dump: `cluster_health.log` (cluster status green/yellow/red, pending tasks), `indices_stats.log`, `instance_indices.log`, `service_info.log`. Also `heartbeat_*.log` reports the OpenSearch service state and disk space.
+3. **Typical root causes** (KB «Журнал изменений не записывается. Диагностика и исправление»):
+   - no free disk space on the OpenSearch host;
+   - shard limit exceeded (`cluster.max_shards_per_node`); deployment guidance requires ≥ 3000 shards capacity;
+   - wrong connection settings on the platform side (URL/credentials/index prefix), TLS/certificate problems;
+   - broken/mismatched index **mapping** (e.g., `text` instead of `keyword`, wrong `date`) → write rejections and "lost" history; fixed by reindexing against the reference `comindware_default_mapping.json` (snapshot before reindexing; stop the platform and pick a low-load window).
+4. **Live checks to recommend to the admin** (on a host with OpenSearch access): `GET /_cluster/health?pretty` (expect green/yellow, watch pending tasks), `GET /_cat/nodes?v` (expected node count), `GET /_cat/pending_tasks?v` (good: empty or 0–2 short tasks; bad: tens/hundreds of tasks, growing queue, `high/urgent` priorities — master-node overload, allocation or disk problems), `GET /_cat/indices?v` + `GET /cmw_<prefix>…/_mapping` / `_count` for the platform indices (interesting suffixes `_sln.*`).
+5. **Remember the delay**: history events appear ~5–10 minutes after the change — first verify whether history is truly "not written" or just "not yet visible".
+6. **Platform-side confirmation**: «Администрирование» → «Инфраструктура» → «Журналы событий», and the «Журнал изменений» panel on a record/process instance; connections are checked on the «Подключения» page («Проверить соединение»).
+
+### 2.2h `process_*.log` and `trigger_*.log` — processes and scenarios
+
+**`process_*.log`** records token movement over process-instance elements (KB «Подсистема журналирования»). Line fields: date, time, message type, process instance id (`PID:XXX`), token id (`TID:ptkn.XX`), element system name and id (`(elementSystemName)psa.XXX`), message text, duration. Three events per diagram element:
+
+- token creation/entry into an element: `Enter(psa.XXX) by Flow:psf.XXX` (no flow id when the token is created);
+- element execution: `Execute` / `ContinueExecute`;
+- token exit: `Exit by Flow:psf.XXX`; lines may list subsequent elements after the `NextActions` keyword.
+
+**Looped process** (user: «процесс зациклился»): look for a repeating chain of the same `psa.*`/`psf.*` events for one `PID` — typical causes are a misconfigured gateway (and/or fork), a timer with a too-short period, or wrong subprocess start settings (creating new instances instead of continuing current records). Process instances with errors are selectable via the N3 predicate `process:hasTokenError true` (KB «Ошибки в процессе. Отслеживание»).
+
+**`trigger_*.log`** — scenario (сценарий) execution: initiator, scenario id, type of the triggering event, record template id, record id, total duration, and per-action breakdown (action id, action type, template, record, duration). Use it for: slow form saves/buttons (find the scenario and its longest action), runaway scenarios (same scenario id firing repeatedly), and correlation with `TriggerAction` records in `performance_*.log`.
 
 ### 2.3 Search methodology
 
@@ -405,7 +496,9 @@ Work systematically and record findings. **The main constraint is the period fro
      - services: `Service stopped`, `Service started`, `restart`, `crash`, `exit code`, systemd `Main process exited`, `Failed to start`;
      - integrations: `connection refused`, `404/401/403` to external APIs, `webhook`, `retry`, `endpoint`, `kafka.*error`, `failed to connect`, `consumer group`;
      - authentication/licensing: `login failed`, `unauthorized`, `license`, `activation`, `expired`, `invalid token`, `401`, `403`;
-     - database: on the Linux stack (Ignite) — `OutOfMemory`, `Heap`, `Off-heap`, `checkpoint`, `StopNodeOrHalt`, `nodeId` restarts; if MongoDB is present — `connection`, `replica`, `secondary`, `not primary`, `slow query`, `aborting`; `journalservice` health markers (`cluster_health`, `unassigned shards`, `red`/`yellow` status).
+     - database: on the Linux stack (ElasticData/Ignite) — `OutOfMemory`, `Heap`, `Off-heap`, `checkpoint`, `StopNodeOrHalt`, `nodeId` restarts; if MongoDB is present — `connection`, `replica`, `secondary`, `not primary`, `slow query`, `aborting`; triple-store uniqueness violation `нарушает уникальность триплета`;
+     - history/journal (OpenSearch): `journalservice` health markers (`cluster_health`, `unassigned shards`, `red`/`yellow` status), `pending_tasks`, `max_shards`, mapping/type conflicts, `journal.enabled` in the instance YML;
+     - processes/scenarios: repeating `Enter(psa.` / `Exit by Flow:psf.` chains for the same `PID` (looped process), long-duration actions in `trigger_*.log`.
 4. **Collect excerpts.** For each found event record:
    - exact timestamp (with TZ) — it must fall inside the window;
    - level and message text;
@@ -418,8 +511,11 @@ Work systematically and record findings. **The main constraint is the period fro
 
 If the logs do not produce a coherent picture, check:
 - whether the incident period is fully covered (the from–to window from 1.4, with no date gaps inside it);
-- whether a log level was filtered out (e.g., only WARN/ERROR without the INFO context);
-- whether relevant logs sit in subfolders you have not looked at.
+- whether a log level was filtered out (e.g., only WARN/ERROR without the INFO context); if `logs.config` is in the dump, verify which logs/levels were enabled at all;
+- whether relevant logs sit in subfolders you have not looked at;
+- **how the dump was made**: the UI button «Скачать журналы» («Конфигурация журналирования») produces `CBAP.ГГГГММЧЧ.log.zip` containing **only non-archived logs**, with no date-range selection — earlier days of the window may be missing; if so, ask for files directly from the server's log directory;
+- **why `performance_*.log` is absent/empty**: the «Производительность»/«Мониторинг» pages and their data require the «Включить мониторинг производительности» checkbox in «Глобальная конфигурация» — its absence is a configuration fact, not a broken dump;
+- **retention**: file logs are kept 100 days by default (`archiveFilesCount` in `logs.config`) — for older incidents the files may simply no longer exist.
 
 If data is insufficient, tell the user exactly which logs are missing and for which period.
 
@@ -451,6 +547,15 @@ For each problem — concrete administrator actions, from simple to complex:
 - strategic (architecture: scaling, version upgrade, custom development).
 - For each solution — the expected effect and signs that it worked.
 
+KB-backed actions to consider (KB «Факторы, влияющие на производительность. Рекомендации по оптимизации» and related — see the KB references appendix):
+
+- isolate a suspect component by stopping it on the «Управление системными службами» page («Администрирование» → «Инфраструктура») — debugging aid only;
+- antivirus exclusions for Ignite/Kafka/OpenSearch directories and instance directories (`Streams`, `Database`, `Temp`);
+- Ignite: memory/JVM heap sizing, node count, periodic defragmentation; OpenSearch: shards/replicas configuration, `cluster.max_shards_per_node`; Kafka: retention period and log segmentation;
+- application level: simplify form rules and expressions, rewrite heavy formulas to N3, reduce computed columns/fields, decompose processes into subprocesses, cut the number of process-diagram versions;
+- verify findings in the platform UI: «Журналы событий» (sessions, OData, operations, AD sync, event tracing), «Производительность», «Мониторинг» dashboards;
+- external monitoring tools: Kibana (OpenSearch), AKHQ/Kafdrop/UI for Apache Kafka (Kafka), JMX/MBeans and system views (Ignite), Zabbix/Prometheus/Grafana, `top`/`htop`/`perf` for the host.
+
 ### 3.5 What to request when data is incomplete
 If data was insufficient, list specifically which logs/metrics and for which period are needed to confirm the root cause.
 
@@ -481,7 +586,7 @@ Ignore incident-specific details (exact timestamps, user names, machine names, d
 
 ### 4.3 Where to save
 
-Lessons are appended to **`LEARNINGS.md`** in the skill directory (`/home/alesha/gh-repos/comindware-log-analysis/LEARNINGS.md`). Each entry:
+Lessons are appended to **`LEARNINGS.md`** in the skill directory (the folder containing this `SKILL.md`). Each entry:
 
 ```markdown
 ### YYYY-MM-DD — Short lesson title
@@ -505,6 +610,32 @@ If a lesson is big or recurring, you may also propose changes to `SKILL.md` itse
 ### 4.5 Using past lessons
 
 Before starting a new analysis (in Step 2), if `LEARNINGS.md` exists in the skill directory, read it and apply relevant lessons: use the recorded markers, correlations, and methodologies from the start.
+
+## KB references (Comindware Platform Knowledge Base)
+
+Cite these articles in reports (Step 3) so administrators can follow the official documentation. `kbId`s below are for the current KB (kb.comindware.ru); **ids differ between platform versions** (v5/v6 branches) — cite article titles first, ids second. Article titles are in Russian.
+
+| Topic | Article title | kbId |
+|-------|---------------|------|
+| File logs: types, naming, contents, NLog config | Подсистема журналирования | 5557 |
+| Log event format examples (audit/security events) | Примеры событий в файловых журналах | 5559 |
+| Default directories (Linux/Windows) | Пути и содержимое директорий экземпляра ПО | 5561 |
+| Instance YML directives, component/service configuration | Конфигурация экземпляра, компонентов ПО и служб. Настройка | 5554 |
+| Architecture: ElasticData, Ignite, OpenSearch, Kafka, nginx, Zabbix | Развёртывание ПО. Архитектура и ИТ-ландшафт | 5443 |
+| Change history not written: diagnostics, reindexing | Журнал изменений не записывается. Диагностика и исправление | 5139 |
+| Performance factors and optimization | Факторы, влияющие на производительность. Рекомендации по оптимизации | 5165 |
+| Load testing (JMeter + platform journals) | Нагрузочное тестирование | 5153 |
+| Licensing: activation, hardware binding, named/concurrent | Лицензирование. Активация, назначение, отзыв и продление лицензий | 5616 |
+| UI event journals (sessions, OData, operations, AD, tracing) | Журналы событий. Типы, просмотр, цепочки событий | 5614 |
+| Monitoring dashboards | Мониторинг. Просмотр диаграмм | 5617 |
+| Performance page (processes, scripts, services, messages, expressions) | Производительность. Просмотр и сброс показателей | 5620 |
+| Log download and logging configuration | Конфигурация журналирования | 5618 |
+| Process errors: `hasTokenError`, notifications | Ошибки в процессе. Отслеживание | 5163 |
+| Looped process | Зациклился процесс — что делать? | 5176 |
+| Script operation error | Ошибка выполнения скриптовой операции | 5177 |
+| Table stops opening (Object reference…) | Перестала открываться таблица (ошибка Object reference…) | 5168 |
+| Reference field values not shown | Не отображаются значения в ссылочном поле | 5180 |
+| Stopping/starting system services | Управление системными службами | (internal) |
 
 ## Practical notes
 
